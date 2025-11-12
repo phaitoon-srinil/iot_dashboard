@@ -64,7 +64,9 @@ const pool = createPool({
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  timezone: 'Z', // เก็บเวลาเป็น UTC
+  // timezone: 'Z', // เก็บเวลาเป็น UTC
+  timezone: '+07:00', // DB เก็บเป็นเวลาไทย
+
 });
 
 pool.query('SELECT 1').then(() => {
@@ -737,13 +739,13 @@ mqttClient.on('message', async (topic, payloadBuf, packet) => {
             let ec = null;
             if (typeof s[`ec${idx}`] === 'number')      ec = s[`ec${idx}`];
            let n = null;
-            if (typeof s[`n${idx}`] === 'number')      n = s[`n${idx}`];
+            if (typeof s[`N${idx}`] === 'number')      n = s[`N${idx}`];
 
             let p = null;
-            if (typeof s[`p${idx}`] === 'number')      p = s[`p${idx}`];
+            if (typeof s[`P${idx}`] === 'number')      p = s[`P${idx}`];
 
            let potassium = 0;
-            if (typeof s[`k${idx}`] === 'number')      potassium = s[`k${idx}`];
+            if (typeof s[`K${idx}`] === 'number')      potassium = s[`K${idx}`];
 
             
             rows.push({
@@ -1090,14 +1092,19 @@ app.get('/api/history/moisture/aggregate', async (req, res) => {
     // Bucket ด้วย UNIX_TIMESTAMP()
     let sql = `
       SELECT
-        FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(m.measured_at)/?)*?)           AS bucket_at,
+        DATE_FORMAT(
+          FROM_UNIXTIME(
+            FLOOR(UNIX_TIMESTAMP(CONVERT_TZ(m.measured_at, '+07:00', '+00:00')) / ?) * ?
+          ),
+          '%Y-%m-%dT%H:%i:%sZ'
+        ) AS bucket_at,
         m.sid                                                              AS sid,
         ${statFn}(m.moisture)                                              AS moisture
       FROM moisture m
       JOIN soilSensor s ON s.sid = m.sid
       JOIN zone z       ON z.zid = s.zid
       JOIN plot p       ON p.pid = z.pid
-      WHERE m.measured_at BETWEEN ? AND ?
+      WHERE CONVERT_TZ(m.measured_at, '+07:00', '+00:00') BETWEEN ? AND ?
         AND p.pid = ?
     `;
     const params = [bucketSec, bucketSec, new Date(start), new Date(end), Number(pid)];
@@ -1173,25 +1180,31 @@ app.get('/api/history/weather/aggregate', async (req, res) => {
     // ---------- โหมดรวม 3 ค่า: temperature + humidity + vpd ----------
     if (allMode) {
       let sql = `
-        SELECT
-          FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(c.measured_at)/?)*?) AS bucket_at,
-          c.wid                                                   AS wid,
-          ${statFn}(c.temperature)                                 AS temperature,
-          ${statFn}(c.humidity)                                    AS humidity,
-          ${statFn}(c.vpd)                                         AS vpd
-        FROM climate c
-        JOIN weatherStation w ON w.wid = c.wid
-        JOIN zone z           ON z.zid = w.zid
-        JOIN plot p           ON p.pid = z.pid
-        WHERE c.measured_at BETWEEN ? AND ?
-          AND p.pid = ?
+      SELECT
+        DATE_FORMAT(
+          FROM_UNIXTIME(
+            FLOOR(
+              UNIX_TIMESTAMP(CONVERT_TZ(c.measured_at, '+07:00', '+00:00')) / ?
+            ) * ?
+          ),
+          '%Y-%m-%dT%H:%i:%sZ'
+        ) AS bucket_at,
+        c.wid,
+        ${statFn}(c.temperature) AS temperature,
+        ${statFn}(c.humidity)    AS humidity,
+        ${statFn}(c.vpd)         AS vpd
+      FROM climate c
+      JOIN weatherStation w ON w.wid = c.wid
+      JOIN zone z           ON z.zid = w.zid
+      JOIN plot p           ON p.pid = z.pid
+      WHERE CONVERT_TZ(c.measured_at, '+07:00', '+00:00') BETWEEN ? AND ?
+        AND p.pid = ?
       `;
       // const params = [bucketSec, bucketSec, new Date(start), new Date(end), Number(pid)];
       const params = [
-        bucketSec, bucketSec,
-        toThailandTime(start),
-        toThailandTime(end),
-        Number(pid)
+        bucketSec, bucketSec,         // สำหรับ FLOOR/UNIX_TIMESTAMP
+        new Date(start), new Date(end),  // ← ใช้ UTC ตรง ๆ
+        Number(pid),
       ];
 
       if (zid) { sql += ` AND z.zid = ? `; params.push(Number(zid)); }
@@ -1572,13 +1585,22 @@ app.get('/api/soil-sensors/history', async (req, res) => {
       params.push(Number(sid));
     }
 
-    const sql = `
-      SELECT m.sid, m.moisture, m.temperature, m.measured_at
+    // const sql = `
+    //   SELECT m.sid, m.moisture, m.temperature, m.measured_at
+    //   FROM moisture m
+    //   WHERE ${where.join(' AND ')}
+    //   ORDER BY m.measured_at ASC
+    //   LIMIT ?
+    // `;
+
+    const sql = 
+      `SELECT
+        m.sid, m.moisture, m.temperature,
+        DATE_FORMAT(CONVERT_TZ(m.measured_at, '+07:00', '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS measured_at
       FROM moisture m
-      WHERE ${where.join(' AND ')}
-      ORDER BY m.measured_at ASC
-      LIMIT ?
-    `;
+      WHERE CONVERT_TZ(m.measured_at, '+07:00', '+00:00') BETWEEN ? AND ?
+      ORDER BY m.measured_at ASC`;
+
     params.push(cap);
 
     const [rows] = await pool.query(sql, params);
@@ -1595,9 +1617,11 @@ app.get('/api/weather/history', async (req, res) => {
   try {
     const { start, end, wid, limit } = req.query;
 
+    // ✅ ตรวจสอบค่าที่ส่งมา
     if (!start || !end) {
       return res.status(400).json({ ok: false, error: 'start and end are required (ISO 8601)' });
     }
+
     const startDate = new Date(start);
     const endDate = new Date(end);
     if (isNaN(startDate) || isNaN(endDate)) {
@@ -1608,7 +1632,10 @@ app.get('/api/weather/history', async (req, res) => {
     const userLimit = Number(limit);
     const cap = Number.isFinite(userLimit) && userLimit > 0 ? Math.min(userLimit, maxCap) : maxCap;
 
-    const where = ['c.measured_at BETWEEN ? AND ?'];
+    const where = [
+      // ✅ เทียบเวลาฝั่งซ้าย (จาก DB) ในรูป UTC เหมือนกับฝั่ง start/end
+      `CONVERT_TZ(c.measured_at, '+07:00', '+00:00') BETWEEN ? AND ?`
+    ];
     const params = [startDate, endDate];
 
     if (wid) {
@@ -1616,13 +1643,22 @@ app.get('/api/weather/history', async (req, res) => {
       params.push(Number(wid));
     }
 
+    // ✅ แปลงเวลาฝั่ง SELECT เป็น UTC-ISO และเพิ่ม LIMIT ?
     const sql = `
-      SELECT c.wid, c.temperature, c.humidity, c.measured_at
+      SELECT
+        c.wid,
+        c.temperature,
+        c.humidity,
+        DATE_FORMAT(
+          CONVERT_TZ(c.measured_at, '+07:00', '+00:00'),
+          '%Y-%m-%dT%H:%i:%sZ'
+        ) AS measured_at
       FROM climate c
       WHERE ${where.join(' AND ')}
       ORDER BY c.measured_at ASC
       LIMIT ?
     `;
+
     params.push(cap);
 
     const [rows] = await pool.query(sql, params);
@@ -1634,15 +1670,16 @@ app.get('/api/weather/history', async (req, res) => {
 });
 
 
+
 // GET /api/weather/history?start=ISO&end=ISO&wid=optional
-app.get('/api/weather/history', async (req, res) => {
-  const { start, end, wid } = req.query;
-  // SELECT wid, temperature, humidity, measured_at
-  // FROM climate
-  // WHERE measured_at BETWEEN ? AND ?
-  // [AND wid = ?]
-  // ORDER BY measured_at ASC
-});
+// app.get('/api/weather/history', async (req, res) => {
+//   const { start, end, wid } = req.query;
+//   // SELECT wid, temperature, humidity, measured_at
+//   // FROM climate
+//   // WHERE measured_at BETWEEN ? AND ?
+//   // [AND wid = ?]
+//   // ORDER BY measured_at ASC
+// });
 
 // ===== Utils เล็กๆ =====
 function parseCSVInt(s) {
@@ -1699,7 +1736,7 @@ app.get('/api/soil-sensors/history/aggregate', async (req, res) => {
     const sql = `
       SELECT
         m.sid,
-        FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(m.measured_at)/?)*?) AS bucket_start,
+        DATE_FORMAT(CONVERT_TZ(FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(m.measured_at)/?)*?),'+00:00','+00:00'),'%Y-%m-%dT%H:%i:%sZ') AS bucket_start,
         AVG(m.moisture)  AS avg_moisture,
         MIN(m.moisture)  AS min_moisture,
         MAX(m.moisture)  AS max_moisture,
@@ -1763,22 +1800,44 @@ app.get('/api/weather/history/aggregate', async (req, res) => {
       params.push(...wids);
     }
 
-    const sql = `
-      SELECT
-        c.wid,
-        FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(c.measured_at)/?)*?) AS bucket_start,
-        AVG(c.temperature) AS avg_temperature,
-        MIN(c.temperature) AS min_temperature,
-        MAX(c.temperature) AS max_temperature,
-        AVG(c.humidity)    AS avg_humidity,
-        MIN(c.humidity)    AS min_humidity,
-        MAX(c.humidity)    AS max_humidity
-      FROM climate c
-      WHERE ${where.join(' AND ')}
-      GROUP BY c.wid, bucket_start
-      ORDER BY bucket_start ASC, c.wid ASC
-      LIMIT ?
-    `;
+    // const sql = `
+    //   SELECT
+    //     c.wid,
+    //     FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(c.measured_at)/?)*?) AS bucket_start,
+    //     AVG(c.temperature) AS avg_temperature,
+    //     MIN(c.temperature) AS min_temperature,
+    //     MAX(c.temperature) AS max_temperature,
+    //     AVG(c.humidity)    AS avg_humidity,
+    //     MIN(c.humidity)    AS min_humidity,
+    //     MAX(c.humidity)    AS max_humidity
+    //   FROM climate c
+    //   WHERE ${where.join(' AND ')}
+    //   GROUP BY c.wid, bucket_start
+    //   ORDER BY bucket_start ASC, c.wid ASC
+    //   LIMIT ?
+    // `;
+  const sql = `
+    SELECT
+      c.wid,
+      DATE_FORMAT(
+        CONVERT_TZ(
+          FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(c.measured_at)/?)*?),
+          '+00:00','+00:00'
+        ),
+        '%Y-%m-%dT%H:%i:%sZ'
+      ) AS bucket_start,
+      AVG(c.temperature) AS avg_temperature,
+      MIN(c.temperature) AS min_temperature,
+      MAX(c.temperature) AS max_temperature,
+      AVG(c.humidity)    AS avg_humidity,
+      MIN(c.humidity)    AS min_humidity,
+      MAX(c.humidity)    AS max_humidity
+    FROM climate c
+    WHERE ${where.join(' AND ')}
+    GROUP BY c.wid, bucket_start
+    ORDER BY bucket_start ASC, c.wid ASC
+    LIMIT ?
+  `;
 
     const [rows] = await pool.query(sql, [sec, sec, ...params, cap]);
     if (stat === 'min') {
