@@ -35,10 +35,10 @@ const MQTT_URLS = (process.env.MQTT_URLS || [
 
 // topic เดียวหรือหลายอันคั่นด้วย comma
 const DEFAULT_TOPICS = [
-  '/mqtt_user001/+/+/weatherStation/+/status/#',
-  '/mqtt_user001/+/+/soilSensor/+/status/#',
-  '/mqtt_user001/+/+/relayBoard/+/status/#',
-  '/mqtt_user001/+/+/inverter/+/status/#',
+  '/+/+/+/weatherStation/+/status/#',
+  '/+/+/+/soilSensor/+/status/#',
+  '/+/+/+/relayBoard/+/status/#',
+  '/+/+/+/inverter/+/status/#',
 ];
 
 const SUB_TOPICS = (
