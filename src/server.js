@@ -12,6 +12,7 @@ require('dotenv').config({
 
 const express = require('express');
 const mqtt = require('mqtt');
+const { ingestQueue } = require('./queue');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
@@ -33,13 +34,21 @@ const MQTT_URLS = (process.env.MQTT_URLS || [
 //   .split(',').map(s => s.trim()).filter(Boolean);
 
 // topic เดียวหรือหลายอันคั่นด้วย comma
-const SUB_TOPICS = (process.env.MQTT_TOPIC || process.env.MQTT_SUB_TOPICS ||
-  // moisture + valve states ทั้งสองรูปแบบ
-  '/buu/iot/+/moisture/state,' +
-  '/buu/iot/+/+/control/state/#' +          // จับ .../state/valveN และ .../state/vN (ถ้ามี)
-  '/buu/iot/+/weather/state/#'
-  // '/buu/iot/+/house+/state/#'        // จับ .../valve/state/vN
-).split(',').map(s => s.trim()).filter(Boolean);
+const DEFAULT_TOPICS = [
+  '/mqtt_user001/+/+/weatherStation/+/status/#',
+  '/mqtt_user001/+/+/soilSensor/+/status/#',
+  '/mqtt_user001/+/+/relayBoard/+/status/#',
+  '/mqtt_user001/+/+/inverter/+/status/#',
+];
+
+const SUB_TOPICS = (
+  process.env.MQTT_TOPIC
+    ? process.env.MQTT_TOPIC.split(',')
+    : DEFAULT_TOPICS
+)
+.map(s => s.trim())
+.filter(Boolean);
+
 
 
 const MSG_BUFFER_MAX = parseInt(process.env.MSG_BUFFER_MAX || '1000', 10);
@@ -602,6 +611,55 @@ function connectMqtt(url) {
   mqttClient.on('error',   (err) => { console.error('[MQTT] error:', err?.message || err); maybeRotate('error'); });
 
 mqttClient.on('message', async (topic, payloadBuf, packet) => {
+
+  // ===== PATCH: PUSH เข้า QUEUE =====
+  try {
+    const payloadStr = payloadBuf.toString('utf8').trim();
+
+    let payload;
+    try {
+      payload = JSON.parse(payloadStr);
+    } catch {
+      payload = payloadStr;
+    }
+
+const parts = topic.split('/').filter(Boolean);
+
+// V2 topic:
+// /{user}/{token}/{farm}/{deviceKind}/{deviceAddr}/status/{dataType}
+
+const meta = {
+  user: parts[0] || null,
+  token: parts[1] || null,
+  farm: parts[2] || null,
+  deviceKind: parts[3] || null,
+  deviceAddr: parts[4] ? Number(parts[4]) : null,
+  dataType: parts[6] || null,
+  topicParts: parts
+};
+
+console.log('[META V2]', meta);
+
+  await ingestQueue.add('ingest', {
+    topic,
+    payload,
+    meta,
+    ts: new Date().toISOString(),
+
+    // ✅ เพิ่มตรงนี้
+    dataType: meta.dataType,
+  });
+
+    console.log('[QUEUE PUSH]', topic);
+    console.log('[QUEUE DATA]', {
+      type: meta.dataType,
+      device: meta.deviceKind,
+    });
+
+  } catch (e) {
+    console.error('[QUEUE ERROR]', e);
+  }
+
   const payloadText = payloadBuf.toString('utf8').trim();
   console.log('[MQTT] RECV', { topic, retain: !!packet?.retain, payload: payloadText, len: payloadBuf.length});
 
@@ -664,13 +722,11 @@ mqttClient.on('message', async (topic, payloadBuf, packet) => {
     if (!vid) { console.warn('[MQTT] valve-state: cannot resolve vid for', topic); return; }
 
     // เขียนลง watering: ON → insert start_at; OFF → update stop_at
-    if (state === 'ON') {
-      await startWateringIfNotOpenYet(pool, Number(vid), when);
-      console.log(`[MQTT] watering start vid=${vid} at ${toMySQLDateTime(when)}`);
-    } else {
-      await stopLatestWatering(pool, Number(vid), when);
-      console.log(`[MQTT] watering stop  vid=${vid} at ${toMySQLDateTime(when)}`);
-    }
+// 🔥 PATCH 3
+console.log('[SERVER] skip watering write → worker will handle', {
+  vid,
+  state,
+});
     return; // จบ fast-path
   }
 
@@ -686,249 +742,233 @@ mqttClient.on('message', async (topic, payloadBuf, packet) => {
     // ================= CASE 1: sensor[] =================
     const msg = JSON.parse(payloadText);
     // if (!Array.isArray(msg?.sensor) || !msg.sensor.length) return;
-    if (Array.isArray(msg?.sensor) && msg.sensor.length > 0) {
+//     if (Array.isArray(msg?.sensor) && msg.sensor.length > 0) {
 
-      const type = String(msg.sensor[0]?.type || '').toLowerCase();
+//       const type = String(msg.sensor[0]?.type || '').toLowerCase();
 
-      // ---------- SOIL MOISTURE ----------
-      if (type === 'moisture') {
-        const rows = [];
+//       // ---------- SOIL MOISTURE ----------
+//       if (type === 'moisture') {
+//         const rows = [];
 
-        for (const s of msg.sensor) {
-          // 1) parse เวลา + ชดเชยโซนเวลา (ค่าเริ่มต้น +420 นาที = +7 ชม.)
-          const rawWhen = s.measured_at || s.date || s.datetime || s.ts || s.time;
-          let dt = parseFlexibleDate(rawWhen) || new Date();
+//         for (const s of msg.sensor) {
+//           // 1) parse เวลา + ชดเชยโซนเวลา (ค่าเริ่มต้น +420 นาที = +7 ชม.)
+//           const rawWhen = s.measured_at || s.date || s.datetime || s.ts || s.time;
+//           let dt = parseFlexibleDate(rawWhen) || new Date();
 
-          // ชดเชย “เฉพาะ” กรณีที่ไม่มีโซนเวลาในสตริง และ offset ≠ 0
-          if (!hasExplicitTZ(rawWhen) && PAYLOAD_TZ_OFFSET_MIN !== 0) {
-            dt = new Date(dt.getTime() + PAYLOAD_TZ_OFFSET_MIN * 60 * 1000);
-          }        
-          const measuredAt = toMySQLDateTime(dt);
+//           // ชดเชย “เฉพาะ” กรณีที่ไม่มีโซนเวลาในสตริง และ offset ≠ 0
+//           if (!hasExplicitTZ(rawWhen) && PAYLOAD_TZ_OFFSET_MIN !== 0) {
+//             dt = new Date(dt.getTime() + PAYLOAD_TZ_OFFSET_MIN * 60 * 1000);
+//           }        
+//           const measuredAt = toMySQLDateTime(dt);
 
-          // 2) อุณหภูมิ (ถ้ามี)
-          const genericTemp =
-            (typeof s.temperature === 'number') ? s.temperature :
-            (typeof s.temp === 'number')        ? s.temp        : null;
+//           // 2) อุณหภูมิ (ถ้ามี)
+//           const genericTemp =
+//             (typeof s.temperature === 'number') ? s.temperature :
+//             (typeof s.temp === 'number')        ? s.temp        : null;
  
-          // 3) ไล่ key smN → แม็ป sid ด้วย (topic, field)
-          for (const [k, v] of Object.entries(s)) {
-            const m = /^sm(\d+)$/.exec(k);
-            if (!m) continue;
-            const idx = Number(m[1]);
-            const moistureVal = Number(v);
-            if (!Number.isFinite(moistureVal)) continue;
+//           // 3) ไล่ key smN → แม็ป sid ด้วย (topic, field)
+//           for (const [k, v] of Object.entries(s)) {
+//             const m = /^sm(\d+)$/.exec(k);
+//             if (!m) continue;
+//             const idx = Number(m[1]);
+//             const moistureVal = Number(v);
+//             if (!Number.isFinite(moistureVal)) continue;
 
-            // หา sid จาก binding: (topic, 'sm1'|'sm2'|...)
-            const field = `sm${idx}`;
-            const sid = await lookupSidForField(pool, topic, field);
+//             // หา sid จาก binding: (topic, 'sm1'|'sm2'|...)
+//             const field = `sm${idx}`;
+//             const sid = await lookupSidForField(pool, topic, field);
 
-            if (!sid) {
-              console.warn(`[INGEST] no binding for ${field} @ ${topic} -> skip`);
-              continue;
-            }
+//             if (!sid) {
+//               console.warn(`[INGEST] no binding for ${field} @ ${topic} -> skip`);
+//               continue;
+//             }
 
-            // temp เฉพาะช่อง (stN/tN) > temp รวม
-            let temp = genericTemp;
-            if (typeof s[`st${idx}`] === 'number')      temp = s[`st${idx}`];
-            else if (typeof s[`t${idx}`]  === 'number') temp = s[`t${idx}`];
+//             // temp เฉพาะช่อง (stN/tN) > temp รวม
+//             let temp = genericTemp;
+//             if (typeof s[`st${idx}`] === 'number')      temp = s[`st${idx}`];
+//             else if (typeof s[`t${idx}`]  === 'number') temp = s[`t${idx}`];
 
-            // ph เฉพาะช่อง (phN/tN) > temp รวม
-            let ph = null;
-            if (typeof s[`ph${idx}`] === 'number')      ph = s[`ph${idx}`];
+//             // ph เฉพาะช่อง (phN/tN) > temp รวม
+//             let ph = null;
+//             if (typeof s[`ph${idx}`] === 'number')      ph = s[`ph${idx}`];
  
-            let ec = null;
-            if (typeof s[`ec${idx}`] === 'number')      ec = s[`ec${idx}`];
-           let n = null;
-            if (typeof s[`N${idx}`] === 'number')      n = s[`N${idx}`];
+//             let ec = null;
+//             if (typeof s[`ec${idx}`] === 'number')      ec = s[`ec${idx}`];
+//            let n = null;
+//             if (typeof s[`N${idx}`] === 'number')      n = s[`N${idx}`];
 
-            let p = null;
-            if (typeof s[`P${idx}`] === 'number')      p = s[`P${idx}`];
+//             let p = null;
+//             if (typeof s[`P${idx}`] === 'number')      p = s[`P${idx}`];
 
-           let potassium = 0;
-            if (typeof s[`K${idx}`] === 'number')      potassium = s[`K${idx}`];
+//            let potassium = 0;
+//             if (typeof s[`K${idx}`] === 'number')      potassium = s[`K${idx}`];
 
             
-            rows.push({
-              sid,
-              name: field,
-              moisture: moistureVal,
-              temperature: (typeof temp === 'number') ? temp : null,
-              ph: (typeof ph === 'number')?ph:null,
-              ec: (typeof ec === 'number')?ec:null,
-              n: (typeof n === 'number')?n:null,
-              p: (typeof p === 'number')?p:null,
-              k: (typeof potassium === 'number')?potassium:null,
-              measured_at: measuredAt,   // เก็บเป็นสตริง MySQL พร้อมแล้ว
-            });
-          }
-        }
+//             rows.push({
+//               sid,
+//               name: field,
+//               moisture: moistureVal,
+//               temperature: (typeof temp === 'number') ? temp : null,
+//               ph: (typeof ph === 'number')?ph:null,
+//               ec: (typeof ec === 'number')?ec:null,
+//               n: (typeof n === 'number')?n:null,
+//               p: (typeof p === 'number')?p:null,
+//               k: (typeof potassium === 'number')?potassium:null,
+//               measured_at: measuredAt,   // เก็บเป็นสตริง MySQL พร้อมแล้ว
+//             });
+//           }
+//         }
 
-        if (!rows.length) return;
+//         if (!rows.length) return;
 
-        // 4) insert ทีละแถว
-        for (const r of rows) {
-          await pool.query(
-            `INSERT INTO moisture (moisture, temperature, ph, ec_us_cm, n, p, k, measured_at, sid)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [r.moisture, r.temperature, r.ph, r.ec, r.n, r.p, r.k, r.measured_at, r.sid]
-          );
-        }
-        console.log(`[MQTT] moisture inserted: ${rows.length} row(s)`);
+//         // 4) insert ทีละแถว
 
-        // 5) broadcast SSE
-        for (const r of rows) {
-          broadcastEvent({
-            type: 'moisture',
-            sid: r.sid,
-            name: r.name,
-            moisture: r.moisture,
-            temperature: r.temperature ?? null,
-            measured_at: new Date(r.measured_at).toISOString(),
-          });
-        }
-        return;
-      }
+//         console.log(`[MQTT] moisture inserted: ${rows.length} row(s)`);
 
-      // ---------- LIVE WEATHER / CLIMATE ----------
-      if (type === 'weather') {
-        const rows = [];
+//         // 5) broadcast SSE
+//         for (const r of rows) {
+//           broadcastEvent({
+//             type: 'moisture',
+//             sid: r.sid,
+//             name: r.name,
+//             moisture: r.moisture,
+//             temperature: r.temperature ?? null,
+//             measured_at: new Date(r.measured_at).toISOString(),
+//           });
+//         }
+//         return;
+//       }
 
-        for (const s of msg.sensor) {
-          // เวลา: ถ้า payload ไม่มี ให้ใช้เวลาปัจจุบัน
-          const rawWhen = s.measured_at || s.date || s.datetime || s.ts || s.time;
-          let dt = parseFlexibleDate(rawWhen) || new Date();
+//       // ---------- LIVE WEATHER / CLIMATE ----------
+//       if (type === 'weather') {
+//         const rows = [];
 
-          // ชดเชยโซนเวลาเฉพาะกรณีไม่มี TZ ในสตริง และตั้งค่า OFFSET ไว้
-          if (!hasExplicitTZ(rawWhen) && PAYLOAD_TZ_OFFSET_MIN !== 0) {
-            dt = new Date(dt.getTime() + PAYLOAD_TZ_OFFSET_MIN * 60 * 1000);
-          }      
-          const measuredAt = toMySQLDateTime(dt);
-          console.log("measure_at:",measuredAt);
+//         for (const s of msg.sensor) {
+//           // เวลา: ถ้า payload ไม่มี ให้ใช้เวลาปัจจุบัน
+//           const rawWhen = s.measured_at || s.date || s.datetime || s.ts || s.time;
+//           let dt = parseFlexibleDate(rawWhen) || new Date();
+
+//           // ชดเชยโซนเวลาเฉพาะกรณีไม่มี TZ ในสตริง และตั้งค่า OFFSET ไว้
+//           if (!hasExplicitTZ(rawWhen) && PAYLOAD_TZ_OFFSET_MIN !== 0) {
+//             dt = new Date(dt.getTime() + PAYLOAD_TZ_OFFSET_MIN * 60 * 1000);
+//           }      
+//           const measuredAt = toMySQLDateTime(dt);
+//           console.log("measure_at:",measuredAt);
 
 
 
-          // หา wid: payload > topic (/weather/state) > binding(field) > DEFAULT_WID
-          let wid = await lookupWidForTopic(pool, topic, s.name);
-          if (!Number.isFinite(Number(wid))) {
-            // หากยังไม่ใช่ตัวเลข (กรณี payload ใส่เป็น string ที่ไม่มีใน binding)
-            wid = DEFAULT_WID;
-          } else {
-            wid = Number(wid);
-          }
+//           // หา wid: payload > topic (/weather/state) > binding(field) > DEFAULT_WID
+//           let wid = await lookupWidForTopic(pool, topic, s.name);
+//           if (!Number.isFinite(Number(wid))) {
+//             // หากยังไม่ใช่ตัวเลข (กรณี payload ใส่เป็น string ที่ไม่มีใน binding)
+//             wid = DEFAULT_WID;
+//           } else {
+//             wid = Number(wid);
+//           }
 
-          // กันพลาด: wid ต้องมีจริงใน weatherStation
-          if (!await ensureWidExists(wid)) {
-            console.warn(`[MQTT] weather: wid ${wid} not found -> skip item`);
-            continue;
-          }
+//           // กันพลาด: wid ต้องมีจริงใน weatherStation
+//           if (!await ensureWidExists(wid)) {
+//             console.warn(`[MQTT] weather: wid ${wid} not found -> skip item`);
+//             continue;
+//           }
 
-          // map ชื่อคีย์จาก ESP32 -> คอลัมน์ใน climate
-          rows.push({
-            name:    s.name,
-            temperature:     toNumOrNull(s.temperature),
-            humidity:        toNumOrNull(s.humidity),
-            vpd:             toNumOrNull(s.vpd),
-            dew_point:       toNumOrNull(s.dew_point),
-            wind_speed:      toNumOrNull(s.wind_speed),
-            wind_gust:       toNumOrNull(s.wind_gust),
-            wind_direction:  toNumOrNull(s.wind_direction),
-            wind_max_day:    toNumOrNull(s.wind_max_day),
-            solar_radiation: toNumOrNull(s.solar_radiation),
-            uv_index:        toNumOrNull(s.uv_index),
-            rain_day:        toNumOrNull(s.rain_day),
-            measured_at:     measuredAt,   // Date object (จะถูกแปลงเป็น 'YYYY-MM-DD HH:mm:SS' ใน insert helper)
-            wid
-          });
-        }
+//           // map ชื่อคีย์จาก ESP32 -> คอลัมน์ใน climate
+//           rows.push({
+//             name:    s.name,
+//             temperature:     toNumOrNull(s.temperature),
+//             humidity:        toNumOrNull(s.humidity),
+//             vpd:             toNumOrNull(s.vpd),
+//             dew_point:       toNumOrNull(s.dew_point),
+//             wind_speed:      toNumOrNull(s.wind_speed),
+//             wind_gust:       toNumOrNull(s.wind_gust),
+//             wind_direction:  toNumOrNull(s.wind_direction),
+//             wind_max_day:    toNumOrNull(s.wind_max_day),
+//             solar_radiation: toNumOrNull(s.solar_radiation),
+//             uv_index:        toNumOrNull(s.uv_index),
+//             rain_day:        toNumOrNull(s.rain_day),
+//             measured_at:     measuredAt,   // Date object (จะถูกแปลงเป็น 'YYYY-MM-DD HH:mm:SS' ใน insert helper)
+//             wid
+//           });
+//         }
 
-        if (!rows.length) return;
+//         if (!rows.length) return;
 
-        const n = await insertClimateRows(pool, rows);
-        console.log(`[MQTT] climate inserted: ${n} row(s)`);
+// // 🔥 PATCH 3: ปิด DB write ใน server
+// console.log('[SERVER] skip climate insert → worker will handle');
 
-        // Broadcast แบบเรียลไทม์ (SSE/WS)
-        for (const r of rows) {
-          broadcastEvent({
-            type: 'weather',
-            wid: r.wid,
-            name: r.name,
-            temperature: r.temperature,
-            humidity: r.humidity,
-            vpd: r.vpd,
-            dew_point: r.dew_point,
-            wind_speed: r.wind_speed,
-            wind_gust: r.wind_gust,
-            wind_direction: r.wind_direction,
-            wind_max_day: r.wind_max_day,
-            solar_radiation: r.solar_radiation,
-            uv_index: r.uv_index,
-            rain_day: r.rain_day,
-            measured_at: (r.measured_at instanceof Date ? r.measured_at : new Date(r.measured_at)).toISOString(),
-          });
-        }
+// // (ยัง broadcast ได้ถ้าต้องการ realtime)
+// for (const r of rows) {
+//   broadcastEvent({
+//     type: 'weather',
+//     wid: r.wid,
+//     temperature: r.temperature,
+//     humidity: r.humidity,
+//     measured_at: new Date(r.measured_at).toISOString(),
+//   });
+// }
 
-        return;
-      }
+//         return;
+//       }
 
-      // ---------- HOURLY WEATHER ----------
-      if (type === 'hourly') {
-        const rows = [];
+//       // ---------- HOURLY WEATHER ----------
+//       if (type === 'hourly') {
+//         const rows = [];
 
-        for (const s of msg.sensor) {
-          // เวลา
-          const rawWhen = s.measured_at || s.date || s.datetime || s.ts || s.time;
-          let dt = parseFlexibleDate(rawWhen) || new Date();
-          if (!hasExplicitTZ(rawWhen) && PAYLOAD_TZ_OFFSET_MIN !== 0) {
-            dt = new Date(dt.getTime() + PAYLOAD_TZ_OFFSET_MIN * 60 * 1000);
-          }
-          const measuredAt = toMySQLDateTime(dt);
+//         for (const s of msg.sensor) {
+//           // เวลา
+//           const rawWhen = s.measured_at || s.date || s.datetime || s.ts || s.time;
+//           let dt = parseFlexibleDate(rawWhen) || new Date();
+//           if (!hasExplicitTZ(rawWhen) && PAYLOAD_TZ_OFFSET_MIN !== 0) {
+//             dt = new Date(dt.getTime() + PAYLOAD_TZ_OFFSET_MIN * 60 * 1000);
+//           }
+//           const measuredAt = toMySQLDateTime(dt);
 
-          // หา wid: payload > topic (/weather/state/{id}) > binding(field) > DEFAULT_WID
-          let widAny = await lookupWidForTopic(pool, topic, s.name);
-          let wid = Number(widAny);
-          if (!Number.isFinite(wid)) wid = DEFAULT_WID;
+//           // หา wid: payload > topic (/weather/state/{id}) > binding(field) > DEFAULT_WID
+//           let widAny = await lookupWidForTopic(pool, topic, s.name);
+//           let wid = Number(widAny);
+//           if (!Number.isFinite(wid)) wid = DEFAULT_WID;
 
-          if (!await ensureWidExists(wid)) {
-            console.warn(`[MQTT] hourly: wid ${wid} not found -> skip`);
-            continue;
-          }
+//           if (!await ensureWidExists(wid)) {
+//             console.warn(`[MQTT] hourly: wid ${wid} not found -> skip`);
+//             continue;
+//           }
 
-          // map key จาก ESP32 -> คอลัมน์ตาราง
-          rows.push({
-            h_temperature:     s.h_temperature,
-            h_humidity:        s.h_humidity,
-            h_wind_speed:      s.h_wind_speed,
-            h_solar_radiation: s.h_solar_radiation,
-            h_eto:             s.h_ETo,
-            measured_at:     measuredAt,
-            wid
-          });
-        }
+//           // map key จาก ESP32 -> คอลัมน์ตาราง
+//           rows.push({
+//             h_temperature:     s.h_temperature,
+//             h_humidity:        s.h_humidity,
+//             h_wind_speed:      s.h_wind_speed,
+//             h_solar_radiation: s.h_solar_radiation,
+//             h_eto:             s.h_ETo,
+//             measured_at:     measuredAt,
+//             wid
+//           });
+//         }
 
-        if (!rows.length) return;
+//         if (!rows.length) return;
 
-        const n = await insertHourlyWeatherRows(pool, rows);
-        console.log(`[MQTT] hourly_weather inserted: ${n} row(s)`);
+// // 🔥 PATCH 3
+// console.log('[SERVER] skip hourly_weather insert → worker will handle');
 
-        // (ถ้าต้องการ) broadcast ให้ frontend
-        for (const r of rows) {
-          broadcastEvent({
-            type: 'hourly',
-            wid: r.wid,
-            h_temperature: r.h_temperature,
-            h_humidity: r.h_humidity,
-            h_wind_speed: r.h_wind_speed,
-            h_solar_radiation: r.h_solar_radiation,
-            h_eto: r.h_eto,
-            measured_at: new Date(r.measured_at).toISOString(),
-          });
-        }
+//         // (ถ้าต้องการ) broadcast ให้ frontend
+//         for (const r of rows) {
+//           broadcastEvent({
+//             type: 'hourly',
+//             wid: r.wid,
+//             h_temperature: r.h_temperature,
+//             h_humidity: r.h_humidity,
+//             h_wind_speed: r.h_wind_speed,
+//             h_solar_radiation: r.h_solar_radiation,
+//             h_eto: r.h_eto,
+//             measured_at: new Date(r.measured_at).toISOString(),
+//           });
+//         }
 
 
-        return;
-      }
+//         return;
+//       }
 
-    }
+//     }
 
     if (Array.isArray(msg?.irrigation) && msg.irrigation.length > 0) {
       const type = String(msg.irrigation[0]?.type || '').toLowerCase();
@@ -975,8 +1015,8 @@ mqttClient.on('message', async (topic, payloadBuf, packet) => {
 
         if (!rows.length) return;
 
-        const n = await insertHourlyIrrigationRows(pool, rows);
-        console.log(`[MQTT] hourly_irrigation inserted: ${n} row(s)`);
+// 🔥 PATCH 3
+console.log('[SERVER] skip hourly_irrigation insert → worker will handle');
 
         // (ไม่บังคับ) broadcast เพื่อแจ้ง frontend
         for (const r of rows) {
