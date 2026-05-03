@@ -10,6 +10,10 @@ require('dotenv').config({
   override: true,        // <-- ให้ .env ทับ ENV ที่ตั้งไว้ใน shell
 });
 
+
+console.log('[SERVER REDIS]', process.env.REDIS_URL);
+console.log('[SERVER DB]', process.env.DB_HOST);
+
 const express = require('express');
 const mqtt = require('mqtt');
 const { ingestQueue } = require('./queue');
@@ -35,10 +39,10 @@ const MQTT_URLS = (process.env.MQTT_URLS || [
 
 // topic เดียวหรือหลายอันคั่นด้วย comma
 const DEFAULT_TOPICS = [
-  '/+/+/+/weatherStation/+/status/#',
-  '/+/+/+/soilSensor/+/status/#',
-  '/+/+/+/relayBoard/+/status/#',
-  '/+/+/+/inverter/+/status/#',
+  '/mqtt_user001/+/+/weatherStation/+/status/#',
+  '/mqtt_user001/+/+/soilSensor/+/status/#',
+  '/mqtt_user001/+/+/relayBoard/+/status/#',
+  '/mqtt_user001/+/+/inverter/+/status/#',
 ];
 
 const SUB_TOPICS = (

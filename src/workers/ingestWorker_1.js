@@ -323,53 +323,6 @@ async function handleWeather({ payload, pid, deviceAddr }) {
 }
 
 // ---------- SOIL ----------
-async function updateHourlyMoisture(sid, wid, item, ts) {
-
-  const hourTs = ts.substring(0, 13) + ':00:00';
-
-  const n = item.N ?? item.n ?? null;
-  const p = item.P ?? item.p ?? null;
-  const k = item.K ?? item.k ?? null;
-  const ph = item.pH ?? item.ph ?? null;
-
-  await db.exec(
-    `INSERT INTO hourly_moisture
-     (sid, wid, moisture_avg, temperature_avg, ec_avg, ph_avg,
-      n_avg, p_avg, k_avg, measured_at, sample_count)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-     ON DUPLICATE KEY UPDATE
-       moisture_avg = (moisture_avg * sample_count + VALUES(moisture_avg)) / (sample_count + 1),
-       temperature_avg = (temperature_avg * sample_count + VALUES(temperature_avg)) / (sample_count + 1),
-       ec_avg = (ec_avg * sample_count + VALUES(ec_avg)) / (sample_count + 1),
-       ph_avg = (ph_avg * sample_count + VALUES(ph_avg)) / (sample_count + 1),
-       n_avg = (n_avg * sample_count + VALUES(n_avg)) / (sample_count + 1),
-       p_avg = (p_avg * sample_count + VALUES(p_avg)) / (sample_count + 1),
-       k_avg = (k_avg * sample_count + VALUES(k_avg)) / (sample_count + 1),
-       sample_count = sample_count + 1`,
-    [
-      sid,
-      wid,
-      item.moisture,
-      item.temperature,
-      item.ec ?? null,
-      ph,
-      n,
-      p,
-      k,
-      hourTs
-    ]
-  );
-
-  console.log('[HOURLY MOISTURE]', {
-    sid,
-    hourTs,
-    moisture: item.moisture,
-    n,
-    p,
-    k
-  });
-}
-
 async function handleSoil({ payload, pid, deviceAddr }) {
 
   const wid = await resolveWid(pid, deviceAddr);
@@ -384,54 +337,25 @@ async function handleSoil({ payload, pid, deviceAddr }) {
     const sid = await resolveSid(pid, item.addr);
     if (!sid) continue;
 
-    // 🔧 normalize field (กัน case mismatch)
-    const n = item.N ?? item.n ?? null;
-    const p = item.P ?? item.p ?? null;
-    const k = item.K ?? item.k ?? null;
-    const ph = item.pH ?? item.ph ?? null;
-
-    // 🔧 skip sensor error (-0.01)
-    if (
-      item.moisture < 0 ||
-      item.temperature < 0 ||
-      item.ec < 0
-    ) {
-      console.warn('[SOIL INVALID SKIP]', item);
-      continue;
-    }
-
     await db.exec(
       `INSERT INTO moisture
-      (moisture, temperature, ph, ec_us_cm, n, p, k, measured_at, sid)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        moisture = VALUES(moisture),
-        temperature = VALUES(temperature),
-        ph = VALUES(ph),
-        ec_us_cm = VALUES(ec_us_cm),
-        n = VALUES(n),
-        p = VALUES(p),
-        k = VALUES(k)`,
+       (moisture, temperature, ph, ec_us_cm, measured_at, sid)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         moisture = VALUES(moisture)`,
       [
         item.moisture,
         item.temperature,
-        ph,
+        item.pH ?? null,
         item.ec ?? null,
-        n,
-        p,
-        k,
         ts,
         sid
       ]
     );
-    
-    await updateHourlyMoisture(sid, wid, item, ts);
-
-  }
+  }c
 
   console.log('[SOIL DONE]', { wid });
 }
-
 
 // ===================== WORKER =====================
 const worker = new Worker(
